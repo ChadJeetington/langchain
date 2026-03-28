@@ -5,15 +5,75 @@ Production architecture for LangChain ReAct agents with MCP tool servers and sep
 ## Overview
 
 ```
-┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-│   LANGCHAIN  │ MCP  │     MCP      │ HTTP │     AI       │
-│    AGENT     │─────▶│    SERVER    │─────▶│   SERVER     │
-│ (Orchestrate)│◀─────│(Context/Tool)│◀─────│(Trade Logic) │
-└──────────────┘      └──────────────┘      └──────────────┘
-      │                      │                     │
- Ephemeral              Persistent             Stateless
- Reasoning              Domain State           Pure Logic
+                        ┌─────────────────────────────────────────┐
+                        │            LOCAL ENVIRONMENT             │
+                        │                                          │
+  ┌──────────────┐      │  ┌──────────────┐                       │
+  │   LANGCHAIN  │ MCP  │  │   INTERNAL   │                       │
+  │    AGENT     │─────────│  MCP SERVER  │                       │
+  │ (Orchestrate)│◀────────│  (stdio/IPC) │                       │
+  └──────┬───────┘      │  └──────────────┘                       │
+         │              │   Domain state, session context,         │
+         │              │   local tools (no auth required)         │
+         │              └─────────────────────────────────────────┘
+         │
+         │ MCP (HTTPS + Auth)
+         │
+         ▼
+  ┌──────────────┐      ┌──────────────┐
+  │   EXTERNAL   │ HTTP │     AI       │
+  │  MCP SERVER  │─────▶│   SERVER     │
+  │  (Deployed)  │◀─────│(Domain Logic)│
+  └──────────────┘      └──────────────┘
+  HTTPS, API key auth       Stateless
+  Rate limiting             Pure Logic
+  Audit logging
+  Public/shared tools
 ```
+
+**Key distinction:**
+- **Internal MCP server** — runs locally via `stdio`/IPC, no network exposure, no auth overhead. Owns session state and local domain data.
+- **External MCP server** — deployed service reachable over HTTPS, requires authentication, handles shared/public tools and proxies the AI server.
+
+## MCP Server Types
+
+### Internal MCP Server (`stdio`)
+
+Registered in `.mcp.json` as:
+```json
+"my-internal-server": {
+  "type": "stdio",
+  "command": "python",
+  "args": ["-m", "my_internal_server"]
+}
+```
+
+- Runs as a local subprocess — no network, no TLS, no auth token needed
+- Owns session context, local domain state, user preferences
+- Fast (IPC vs. network round-trip)
+- Dies when the agent process dies (or can be kept alive as a daemon)
+
+### External MCP Server (`http`)
+
+Registered in `.mcp.json` as:
+```json
+"my-external-server": {
+  "type": "http",
+  "url": "https://your-domain.com/mcp",
+  "headers": {
+    "Authorization": "Bearer ${MY_SERVER_API_KEY}"
+  }
+}
+```
+
+See `.mcp.json` for examples already in use (`docs-langchain`, `reference-langchain`).
+
+- Persistent, deployed service (e.g., FastAPI + streamable HTTP transport)
+- Requires HTTPS and per-request auth (`Authorization` header via env var)
+- Handles shared/public tools and proxies the AI server
+- Responsible for rate limiting, circuit breaking, audit logging, and prompt-injection sanitization
+
+---
 
 ## Component Responsibilities
 
@@ -70,18 +130,22 @@ Production architecture for LangChain ReAct agents with MCP tool servers and sep
 
 ## Connection Pattern (Recommended)
 
-MCP Server proxies AI Server calls:
+The agent speaks only MCP protocol to both server types. The external MCP server is the single point of contact for the AI server — the agent never calls the AI server directly.
 
 ```
-Agent ──MCP──▶ MCP Server ──HTTP──▶ AI Server
+Agent ──stdio──▶ Internal MCP Server  (local state, session context)
+
+Agent ──HTTPS──▶ External MCP Server ──HTTP──▶ AI Server
+                 (auth, rate limit,              (stateless,
+                  audit, caching)                 pure logic)
 ```
 
 Benefits:
-- Agent only speaks MCP protocol
-- Unified error handling in one place
-- MCP can cache expensive AI calls
-- MCP can rate-limit, audit, circuit-break
-- AI Server stays pure and reusable
+- Agent speaks one protocol (MCP) regardless of server type
+- Internal server: zero-latency for local state access
+- External server: unified error handling, caching, circuit-breaking for remote calls
+- AI Server stays pure (no MCP awareness, callable by any system)
+- Auth and rate limiting enforced at the external MCP boundary, not inside the agent
 
 ## State Ownership Matrix
 
